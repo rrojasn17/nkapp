@@ -1,8 +1,12 @@
-from fastapi import FastAPI, Depends, Header, HTTPException, Query
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import Optional, Any, Dict, Tuple, List
+import logging
+import json
+import uuid
+from datetime import timezone
 
 from database import Base, engine, get_db
 from config import CORS_ORIGINS, IS_PROD, TTN_WEBHOOK_SECRET
@@ -40,6 +44,16 @@ from security import (
 
 
 app = FastAPI(title="Ingesta TTN + API (Producción-ready)")
+logger = logging.getLogger("ttn")
+logging.basicConfig(level=logging.INFO)
+
+def _safe_json(obj, limit: int = 4000) -> str:
+    try:
+        s = json.dumps(obj, ensure_ascii=False, default=str)
+        return s[:limit] + ("…(truncado)" if len(s) > limit else "")
+    except Exception:
+        return str(obj)[:limit]
+
 
 # CORS configurable por variables de entorno
 if CORS_ORIGINS:
@@ -318,55 +332,95 @@ def aplanar_numericos(obj: Any, prefijo: str = "") -> List[Tuple[str, float, Opt
 # Webhook TTN/TTS -> Medicion + ValorMedicion
 # =========================================================
 @app.post("/ttn/webhook")
-def ttn_webhook(
-    body: TTNWebhookIn,
+async def ttn_webhook(
+    request: Request,
     db: Session = Depends(get_db),
     x_webhook_secret: str = Header("", alias="X-Webhook-Secret"),
 ):
+    # ID corto para rastrear en logs
+    rid = str(uuid.uuid4())[:8]
+
+    # --- Seguridad ---
     if TTN_WEBHOOK_SECRET and x_webhook_secret != TTN_WEBHOOK_SECRET:
+        logger.warning(f"[TTN][{rid}] 401 Unauthorized: X-Webhook-Secret inválido")
         raise HTTPException(status_code=401, detail="Webhook no autorizado")
 
-    payload = body.raw
+    # --- Leer JSON crudo ---
+    try:
+        payload = await request.json()
+    except Exception as e:
+        logger.exception(f"[TTN][{rid}] 400 JSON inválido: {e}")
+        raise HTTPException(status_code=400, detail="JSON inválido")
 
+    # --- Logs base (para ver exactamente qué llega) ---
+    headers = dict(request.headers)
+    logger.info(f"[TTN][{rid}] IN content-type={headers.get('content-type')} user-agent={headers.get('user-agent')}")
+    if isinstance(payload, dict):
+        logger.info(f"[TTN][{rid}] IN top_keys={list(payload.keys())}")
+    else:
+        logger.warning(f"[TTN][{rid}] payload no es dict. type={type(payload)} body={_safe_json(payload)}")
+        return {"status": "ok", "rid": rid, "note": "payload no es objeto JSON"}
+
+    # Datos típicos TTN
+    device_id = payload.get("end_device_ids", {}).get("device_id")
+    dev_eui = payload.get("end_device_ids", {}).get("dev_eui")
+    received_at = payload.get("received_at")
+    logger.info(f"[TTN][{rid}] device_id={device_id} dev_eui={dev_eui} received_at={received_at}")
+
+    # --- Resolver EUI ---
     eui = extraer_eui(payload)
     if not eui:
-        raise HTTPException(status_code=400, detail="No se encontró eui/dev_eui en el payload")
+        # Guardar raw sería ideal, pero sin eui no podemos asociar a Dispositivo.
+        logger.warning(f"[TTN][{rid}] sin eui/dev_eui. payload={_safe_json(payload)}")
+        # Responder 200 para que TTN no reintente en bucle
+        return {"status": "ok", "rid": rid, "note": "sin eui/dev_eui"}
 
+    # --- Buscar dispositivo en BD ---
     dispositivo = db.query(Dispositivo).filter(Dispositivo.eui == eui).first()
     if not dispositivo:
-        raise HTTPException(status_code=404, detail=f"Dispositivo no registrado para eui={eui}")
+        logger.warning(f"[TTN][{rid}] dispositivo NO registrado. eui={eui}. payload={_safe_json(payload)}")
+        # Responder 200 para evitar reintentos; así podés ver el payload y registrar el dispositivo luego.
+        return {"status": "ok", "rid": rid, "note": f"dispositivo no registrado eui={eui}"}
 
+    # --- Uplink ---
     uplink = payload.get("uplink_message")
     uplink = uplink if isinstance(uplink, dict) else {}
 
-    fecha_hora = extraer_fecha_hora(payload) or datetime.utcnow()
+    # --- Fecha/hora ---
+    fecha_hora = extraer_fecha_hora(payload) or datetime.now(timezone.utc)
 
+    # --- Elegir normalized/decoded ---
     origen, payload_elegido = elegir_payload(uplink)
-    if origen == "none":
-        raise HTTPException(status_code=400, detail="No hay decoded_payload ni normalized_payload disponible")
+    logger.info(f"[TTN][{rid}] origen={origen}")
 
+    decoded_keys = None
+    decoded_payload = uplink.get("decoded_payload")
+    if isinstance(decoded_payload, dict):
+        decoded_keys = list(decoded_payload.keys())
+    logger.info(f"[TTN][{rid}] decoded_keys={decoded_keys}")
+
+    # --- Guardar medición SIEMPRE (aunque no haya numéricos) ---
     medicion = Medicion(
         dispositivo_id=dispositivo.id,
         fecha_hora=fecha_hora,
         origen=origen,
         json_crudo=payload,
-        json_decodificado=uplink.get("decoded_payload") if isinstance(uplink.get("decoded_payload"), dict) else None,
+        json_decodificado=decoded_payload if isinstance(decoded_payload, dict) else None,
         json_normalizado=uplink.get("normalized_payload") if isinstance(uplink.get("normalized_payload"), dict) else None,
     )
 
     db.add(medicion)
     db.flush()  # obtener medicion.id
 
-    items = aplanar_numericos(payload_elegido)
-    if not items:
-        raise HTTPException(status_code=400, detail="No se encontraron variables numéricas en el payload")
+    # --- Aplanar numéricos ---
+    items = aplanar_numericos(payload_elegido) if origen != "none" else []
+    logger.info(f"[TTN][{rid}] numericos_encontrados={len(items)}")
 
     insertados = 0
     for nombre, valor, unidad, ruta in items:
         # filtrar NaN
         if valor != valor:
             continue
-
         db.add(
             ValorMedicion(
                 medicion_id=medicion.id,
@@ -380,8 +434,11 @@ def ttn_webhook(
 
     db.commit()
 
+    logger.info(f"[TTN][{rid}] OK medicion_id={medicion.id} insertados={insertados}")
+
     return {
         "status": "ok",
+        "rid": rid,
         "eui": eui,
         "dispositivo_id": dispositivo.id,
         "medicion_id": medicion.id,
