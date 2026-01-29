@@ -1,0 +1,4 @@
+# Cambia el dominio por el tuyo (ej: api-iotis.ruralcr.com)
+api.tudominio.com {
+  reverse_proxy api:8000
+}
